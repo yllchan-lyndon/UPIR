@@ -3,14 +3,76 @@ import torch.nn as nn
 import torch.nn.functional as F
 import nibabel as nib
 from medpy.io import load
-
+import types
 from Functions import generate_grid, save_img, generate_grid_unit, transform_unit_flow_to_flow_cuda
+from cnn_swin import HybridEncoder, SwinTransformer, DecoderBlock, Conv3dReLU, RegistrationHead
 import numpy as np
 
 import os
 import matplotlib.pyplot as plt
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
+class Config:
+    def __init__(self):
+        # Model parameters
+        self.patch_size = 4
+        self.in_chans = 2                  # Number of input channels
+        self.embed_dim = 8                # Embedding dimension
+        self.depths = (2, 2, 2, 2, 2, 2)         # Depth of each Swin Transformer layer
+        self.num_heads = (4, 4, 4, 4, 4, 4)      # Number of attention heads in each layer
+        self.window_size = (7, 7, 7, 7)    # Window size for self-attention
+        self.mlp_ratio = 4                  # Ratio of MLP hidden dim to embedding dim
+        self.pat_merg_rf = 4                # Patch merging reference factor
+        self.qkv_bias = False                # If True, add a learnable bias to query, key, value
+        self.drop_rate = 0                   # Dropout rate
+        self.drop_path_rate = 0.3            # Stochastic depth rate
+        self.ape = False                     # Absolute position embedding
+        self.spe = False                     # Sinusoidal positional embedding
+        self.rpe = True                      # Relative position embedding
+        self.patch_norm = True               # Use normalization after patch embedding
+        self.use_checkpoint = False           # Use checkpointing
+        self.out_indices = (0, 1, 2, 3)     # Indices of layers to output
+        self.reg_head_chan = 16             # Number of channels in the registration head
+        self.img_size = (160, 160, 80)      # Input image size
+        self.zernike_embed_dim = 121
+        self.num_layers = 6
+
+# Creating a config object
+config = Config()
+
+def get_transmorph_config():
+    '''
+    Creates a default configuration object for TransMorph_lvl3
+    '''
+    config = types.SimpleNamespace()
+    
+    # --- TransMorph Configuration ---
+    # You can customize these parameters
+    config.img_size = (160, 160, 80)
+    config.patch_size = 2
+    config.in_chans = 5  # UPDATED: (warped_x, y, lvl2_disp_up) -> 1+1+3=5 channels
+    config.embed_dim = 8
+    config.depths = [2, 2, 2, 2]
+    config.num_heads = [4, 4, 4, 4]
+    config.window_size = (7, 7, 7, 7)
+    config.mlp_ratio = 4.
+    config.qkv_bias = True
+    config.drop_rate = 0.
+    config.drop_path_rate = 0.1
+    config.ape = False
+    config.spe = False
+    config.rpe = True
+    config.patch_norm = True
+    config.use_checkpoint = False
+    config.out_indices = (0, 1, 2, 3)
+    config.pat_merg_rf = 4
+    
+    # --- Decoder Configuration ---
+    config.if_convskip = True
+    config.if_transskip = True
+    config.reg_head_chan = 16
+    
+    return config
 
 class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(nn.Module):
     def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, num_block=5):
@@ -312,6 +374,7 @@ class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
         bias_opt = False
 
         self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel+3, self.start_channel * 4, bias=bias_opt)
+        # self.encoder = HybridEncoder(config)
 
         self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
 
@@ -325,6 +388,13 @@ class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
         # self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
 
         self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_stress = self.outputs(self.start_channel * 8, 6, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_mask = nn.Sequential(
+            nn.Conv3d(self.start_channel * 8, int((self.start_channel * 8)/2), kernel_size=3, stride=1, padding=1, bias=False),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(int((self.start_channel * 8)/2), 1, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Sigmoid()
+        )
 
 
         # for m in self.modules():
@@ -399,8 +469,9 @@ class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
         cat_input = torch.cat((warpped_x, y, lvl2_disp_up), 1)
 
         fea_e0 = self.input_encoder_lvl1(cat_input)
+        # fea_e0, _, _ = self.encoder(cat_input)
         e0 = self.down_conv(fea_e0)
-
+        # print(e0.shape, lvl2_embedding.shape)
         e0 = e0 + lvl2_embedding
 
         # e0 = self.resblock_group_lvl1(e0)
@@ -411,18 +482,343 @@ class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
                 e0 = self.resblock_group_lvl1[i](e0)
 
         e0 = self.up(e0)
-        output_disp_e0_v = self.output_lvl1(torch.cat([e0, fea_e0], dim=1)) * self.range_flow
+        # fea_e0 = self.up(fea_e0)
+        shared_features = torch.cat([e0, fea_e0], dim=1)
+        output_disp_e0_v = self.output_lvl1(shared_features) * self.range_flow
         # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
         compose_field_e0_lvl1 = output_disp_e0_v + lvl2_disp_up
 
         warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
+        
+        # Head 2: Stress (Physics Expert)
+        predicted_stress = self.output_stress(shared_features)
+
+        # Head 3: Mask (Attention Expert)
+        predicted_mask = self.output_mask(shared_features)
+        # print(predicted_mask.shape, predicted_stress.shape)
 
         if self.is_train is True:
-            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0
+            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0, predicted_stress, predicted_mask
             # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_v, e0, lvl1_warp, lvl1_y, lvl2_warp, lvl2_y
         else:
             return compose_field_e0_lvl1
 
+class uncern_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
+    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4,
+                 model_lvl2=None, num_block=5):
+        super(uncern_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, self).__init__()
+        self.in_channel = in_channel
+        self.n_classes = n_classes
+        self.start_channel = start_channel
+        self.range_flow = range_flow
+        self.is_train = is_train
+        self.imgshape = imgshape
+        self.model_lvl2 = model_lvl2
+        self.grid_1 = generate_grid_unit(self.imgshape)
+        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
+        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
+        self.transform = SpatialTransform_unit().cuda()
+        self.com_transform = CompositionTransform_unit().cuda()
+        bias_opt = False
+
+        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel+3, self.start_channel * 4, bias=bias_opt)
+        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
+        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
+        self.up_tri = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
+                                     padding=0, output_padding=0, bias=bias_opt)
+        
+        # New uncertainty-aware heads
+        # Output displacement field
+        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
+        # Output uncertainty (log-variance)
+        self.output_uncertainty = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
+
+        # Inside your uncern_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3 class
+        # self.conditional_module = nn.Sequential(
+        #     nn.AdaptiveAvgPool3d(1), # Squeeze spatial dimensions
+        #     nn.Flatten(),
+        #     nn.Linear(self.start_channel * 4, 32), # Simple FC layers
+        #     nn.LeakyReLU(0.2),
+        #     nn.Linear(32, 1),
+        #     nn.Sigmoid() # Ensure output is between 0 and 1
+        # )
+
+    def unfreeze_modellvl2(self):
+        print("\nunfreeze model_lvl2 parameter")
+        for param in self.model_lvl2.parameters():
+            param.requires_grad = True
+
+    def resblock_seq(self, in_channels, num_block, bias_opt=False):
+        blocks = []
+        for i in range(num_block):
+            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
+            blocks.append(nn.LeakyReLU(0.2))
+        layer = nn.ModuleList(blocks)
+        return layer
+
+    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                             bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU())
+        else:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
+        return layer
+
+    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+    
+    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
+        """Head to predict log-variance (uncertainty)."""
+        return nn.Sequential(
+            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+        )
+
+    def forward(self, x, y, reg_code):
+        lvl2_disp, _, _, lvl2_v, lvl1_v, lvl2_embedding = self.model_lvl2(x, y, reg_code)
+        lvl2_disp_up = self.up_tri(lvl2_disp)
+        warpped_x = self.transform(x, lvl2_disp_up.permute(0, 2, 3, 4, 1), self.grid_1)
+        cat_input = torch.cat((warpped_x, y, lvl2_disp_up), 1)
+        fea_e0 = self.input_encoder_lvl1(cat_input)
+        e0 = self.down_conv(fea_e0)
+        e0 = e0 + lvl2_embedding
+        for i in range(len(self.resblock_group_lvl1)):
+            if i % 2 == 0:
+                e0 = self.resblock_group_lvl1[i](e0, reg_code)
+            else:
+                e0 = self.resblock_group_lvl1[i](e0)
+        e0 = self.up(e0)
+        shared_features = torch.cat([e0, fea_e0], dim=1)
+        
+        # Predict both the displacement and the uncertainty
+        output_disp_e0_v = self.output_lvl1(shared_features) * self.range_flow
+        output_uncertainty = self.output_uncertainty(shared_features)
+        
+        compose_field_e0_lvl1 = output_disp_e0_v + lvl2_disp_up
+        warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
+        
+        if self.is_train is True:
+            # Return the new uncertainty output
+            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0, output_uncertainty
+        else:
+            return compose_field_e0_lvl1
+        
+class ConditionalDecoderBlock(nn.Module):
+    """A decoder block that uses AdaIN to be conditional on reg_code."""
+    def __init__(self, in_channels, out_channels, skip_channels=0, num_res_blocks=2):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)
+        total_in_channels = in_channels + skip_channels
+        self.conv_in = nn.Conv3d(total_in_channels, out_channels, kernel_size=1, bias=False)
+        
+        # Store the sequence of residual blocks
+        self.resblock = self.resblock_seq(out_channels, num_res_blocks)
+        
+    def resblock_seq(self, in_channels, num_block, bias_opt=False):
+        blocks = []
+        for i in range(num_block):
+            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
+            blocks.append(nn.LeakyReLU(0.2))
+
+        layer = nn.ModuleList(blocks)
+        return layer
+    
+    def forward(self, x, reg_code, skip=None):
+        x = self.up(x)
+        # print(x.shape, skip.shape)
+        if skip is not None:
+            x = torch.cat([x, skip], dim=1)
+        
+        x = self.conv_in(x)
+        # e0 = self.resblock_group_lvl1(e0)
+        for i in range(len(self.resblock)):
+            if i % 2 == 0:
+                x = self.resblock[i](x, reg_code)
+            else:
+                x = self.resblock[i](x)
+        return x
+
+# --- 1. DEFINE THE NEW TRAINABLE "SPECIALIST HEAD" MODEL ---
+class SpecialistHead(torch.nn.Module):
+    """
+    A small, trainable network to project general DINO features into a
+    specialized feature space for the dissimilarity loss.
+    It learns to distinguish between 'tumor' and 'resection cavity' features.
+    """
+    def __init__(self, in_channels=768, out_channels=128):
+        super(SpecialistHead, self).__init__()
+        # Using 1x1 convolutions is an efficient way to apply an MLP to each feature vector.
+        self.projection_head = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, in_channels // 4, kernel_size=1, bias=False),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(in_channels // 4, out_channels, kernel_size=1, bias=False)
+        )
+
+    def forward(self, features):
+        """
+        Args:
+            features (torch.Tensor): General DINO features [B, 768, H, W].
+        Returns:
+            torch.Tensor: Specialized features [B, 128, H, W].
+        """
+        return self.projection_head(features)
+    
+class TransMorph_lvl3(nn.Module):
+    """The TransMorph architecture with a conditional decoder modulated by reg_code."""
+    def __init__(self, config):
+        super(TransMorph_lvl3, self).__init__()
+        self.if_convskip, self.if_transskip = config.if_convskip, config.if_transskip
+        embed_dim = config.embed_dim
+
+        self.transformer = SwinTransformer(patch_size=config.patch_size,
+                                   in_chans=config.in_chans,
+                                   embed_dim=config.embed_dim,
+                                   depths=config.depths,
+                                   num_heads=config.num_heads,
+                                   window_size=config.window_size,
+                                   mlp_ratio=config.mlp_ratio,
+                                   qkv_bias=config.qkv_bias,
+                                   drop_rate=config.drop_rate,
+                                   drop_path_rate=config.drop_path_rate,
+                                   ape=config.ape,
+                                   spe=config.spe,
+                                   rpe=config.rpe,
+                                   patch_norm=config.patch_norm,
+                                   use_checkpoint=config.use_checkpoint,
+                                   out_indices=config.out_indices,
+                                   pat_merg_rf=config.pat_merg_rf,
+                                   )
+
+        # Replace standard decoders with our new conditional ones
+        self.up0 = ConditionalDecoderBlock(embed_dim*8, embed_dim*4, skip_channels=embed_dim*4 if self.if_transskip else 0)
+        self.up1 = ConditionalDecoderBlock(embed_dim*4, embed_dim*2, skip_channels=embed_dim*2 if self.if_transskip else 0)
+        self.up2 = ConditionalDecoderBlock(embed_dim*2, embed_dim, skip_channels=embed_dim if self.if_transskip else 0)
+        
+        if self.if_convskip:
+            self.c1 = Conv3dReLU(config.in_chans, embed_dim, 3, 1)
+        
+        self.up3 = ConditionalDecoderBlock(embed_dim, config.reg_head_chan, skip_channels=embed_dim if self.if_convskip else 0)
+
+        # Multi-head outputs remain the same
+        final_feature_channels = config.reg_head_chan
+        self.reg_head = RegistrationHead(in_channels=final_feature_channels, out_channels=3, kernel_size=3)
+        self.output_stress = nn.Sequential(
+            nn.Conv3d(final_feature_channels, final_feature_channels//2, 3, 1, 1, bias=False), nn.LeakyReLU(0.2),
+            nn.Conv3d(final_feature_channels//2, 6, 3, 1, 1, bias=False), nn.Softsign())
+        self.output_mask = nn.Sequential(
+            nn.Conv3d(final_feature_channels, final_feature_channels//2, 3, 1, 1, bias=False), nn.LeakyReLU(0.2),
+            nn.Conv3d(final_feature_channels//2, 1, 3, 1, 1, bias=False), nn.Sigmoid())
+        
+        self.avg_pool = nn.AvgPool3d(3, stride=2, padding=1)
+
+    def forward(self, x, reg_code):
+        if self.if_convskip: 
+            f4 = self.c1(x)
+            # print(x.shape, f4.shape)
+        else: 
+            f4 = None
+
+        out_feats = self.transformer(x)
+        
+        f1, f2, f3 = (out_feats[2], out_feats[1], out_feats[0]) if self.if_transskip else (None, None, None)
+            
+        # Pass reg_code to each conditional decoder block
+        x = self.up0(out_feats[3], reg_code, f1)
+        x = self.up1(x, reg_code, f2)
+        x = self.up2(x, reg_code, f3)
+        final_features = self.up3(x, reg_code, f4)
+
+        residual_flow = self.reg_head(final_features)
+        predicted_stress = self.output_stress(final_features)
+        predicted_mask = self.output_mask(final_features)
+        
+        # residual_flow = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)(residual_flow)
+        
+        return residual_flow, predicted_stress, predicted_mask
+    
+class Miccai2021_LDR_laplacian_TransMorph_lvl3(nn.Module):
+    """
+    The main Level 3 wrapper. It uses a CNN-based Level 2 model to get a coarse
+    registration and then uses the TransMorph_lvl3 model to compute the final,
+    high-resolution refinement.
+    """
+    def __init__(self, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, model_lvl2=None):
+        super(Miccai2021_LDR_laplacian_TransMorph_lvl3, self).__init__()
+        self.is_train = is_train
+        self.range_flow = range_flow
+        self.imgshape = imgshape
+        
+        self.model_lvl2 = model_lvl2
+        
+        # Get the default configuration for our TransMorph model
+        transmorph_config = get_transmorph_config()
+        
+        # Instantiate the Level 3 TransMorph model
+        self.transmorph_lvl3_model = TransMorph_lvl3(transmorph_config)
+
+        # Utility layers for the forward pass
+        self.grid_1 = generate_grid_unit(self.imgshape)
+        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
+        self.transform = SpatialTransform_unit()
+        self.up_tri = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+
+    def unfreeze_modellvl2(self):
+        print("\nunfreeze model_lvl2 parameters")
+        for param in self.model_lvl2.parameters():
+            param.requires_grad = True
+
+    def forward(self, x, y, reg_code):
+        # 1. Get the coarse displacement field from the frozen Level 2 model
+        # The return signature is: (compose_field, warped_img, target_img_down, residual_v, lvl1_v, lvl2_embedding)
+        lvl2_disp, _, _, lvl2_v, lvl1_v, _ = self.model_lvl2(x, y, reg_code)
+
+        # 2. Prepare inputs for the Level 3 TransMorph model
+        lvl2_disp_up = self.up_tri(lvl2_disp)
+        warpped_x = self.transform(x, lvl2_disp_up.permute(0, 2, 3, 4, 1), self.grid_1)
+        
+        # Create the 5-channel input tensor
+        cat_input = torch.cat((warpped_x, y, lvl2_disp_up), 1)
+
+        # 3. Pass through the TransMorph model to get the residual refinement and other outputs
+        # Note: reg_code is not passed to the transformer as it has no AdaIN layers
+        residual_disp, predicted_stress, predicted_mask = self.transmorph_lvl3_model(cat_input, reg_code)
+        
+        residual_disp = residual_disp * self.range_flow
+
+        # 4. Compose the final displacement field
+        final_disp = residual_disp + lvl2_disp_up
+        
+        # 5. Warp the original image with the final, high-resolution field
+        final_warped_x = self.transform(x, final_disp.permute(0, 2, 3, 4, 1), self.grid_1)
+        
+        # 6. Return values in a format consistent with your training loop
+        if self.is_train:
+            # Return signature:
+            # (final_disp, final_warped, target_img, residual, lvl1_v, lvl2_v, lvl3_embedding, stress, mask)
+            # We return None for CNN-specific embeddings that don't exist in the transformer model.
+            return final_disp, final_warped_x, y, residual_disp, lvl1_v, lvl2_disp, None, predicted_stress, predicted_mask
+        else:
+            return final_disp
 
 class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_t1cet2_lvl1(nn.Module):
     def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, num_block=5, num_con=1):
@@ -737,7 +1133,13 @@ class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_t1cet2_lvl3(nn.Module):
         # self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
 
         self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
-
+        self.output_stress = self.outputs(self.start_channel * 8, 6, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_mask = nn.Sequential(
+            nn.Conv3d(self.start_channel * 8, int((self.start_channel * 8)/2), kernel_size=3, stride=1, padding=1, bias=False),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(int((self.start_channel * 8)/2), 1, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Sigmoid()
+        )
 
         # for m in self.modules():
         #     if isinstance(m, nn.Conv3d):
@@ -822,14 +1224,22 @@ class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_t1cet2_lvl3(nn.Module):
                 e0 = self.resblock_group_lvl1[i](e0)
 
         e0 = self.up(e0)
-        output_disp_e0_v = self.output_lvl1(torch.cat([e0, fea_e0], dim=1)) * self.range_flow
+        shared_features = torch.cat([e0, fea_e0], dim=1)
+        output_disp_e0_v = self.output_lvl1(shared_features) * self.range_flow
         # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
         compose_field_e0_lvl1 = output_disp_e0_v + lvl2_disp_up
 
         warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
+        
+        # Head 2: Stress (Physics Expert)
+        predicted_stress = self.output_stress(shared_features)
+
+        # Head 3: Mask (Attention Expert)
+        predicted_mask = self.output_mask(shared_features)
+        print(predicted_mask.shape, predicted_stress.shape)
 
         if self.is_train is True:
-            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0
+            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0, predicted_stress, predicted_mask
             # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_v, e0, lvl1_warp, lvl1_y, lvl2_warp, lvl2_y
         else:
             return compose_field_e0_lvl1
@@ -1807,9 +2217,11 @@ class NCC_weight(torch.nn.Module):
         J_var = J2_sum - 2 * u_J * J_sum + u_J*u_J*win_size
 
         cc = cross * cross / (I_var * J_var + self.eps)
-
-        # return negative cc.
-        return -1.0 * torch.mean(cc*weight_map)
+        if weight_map is None:
+            return -1.0 * torch.mean(cc)
+        else:
+            # return negative cc.
+            return -1.0 * torch.mean(cc*weight_map)
 
 
 class NCC_weight_allmod(torch.nn.Module):
@@ -2041,7 +2453,8 @@ class multi_resolution_NCC_weight(torch.nn.Module):
 
             I = nn.functional.avg_pool3d(I, kernel_size=3, stride=2, padding=1, count_include_pad=False)
             J = nn.functional.avg_pool3d(J, kernel_size=3, stride=2, padding=1, count_include_pad=False)
-            weight_map = nn.functional.avg_pool3d(weight_map, kernel_size=3, stride=2, padding=1, count_include_pad=False)
+            if weight_map is not None:
+                weight_map = nn.functional.avg_pool3d(weight_map, kernel_size=3, stride=2, padding=1, count_include_pad=False)
 
         return sum(total_NCC)
 
@@ -2152,7 +2565,268 @@ class multi_resolution_Gradient_NCC(torch.nn.Module):
             J = nn.functional.avg_pool3d(J, kernel_size=3, stride=2, padding=1, count_include_pad=False)
 
         return sum(total_NCC)
+    
+class NCC_weight_2D(torch.nn.Module):
+    """
+    2D local (over window) normalized cross correlation for DINO features
+    """
+    def __init__(self, win=5, eps=1e-8, channel=1):
+        super(NCC_weight_2D, self).__init__()
+        self.win = win
+        self.eps = eps
+        self.w_temp = win
+        self.channel = channel
 
+    def forward(self, I, J, weight_map):
+        ndims = 2  # Changed from 3 to 2
+        win_size = self.w_temp
+
+        # set window size
+        if self.win is None:
+            self.win = [5] * ndims
+        else:
+            self.win = [self.w_temp] * ndims
+
+        weight_win_size = self.w_temp
+        # Changed from conv3d to conv2d weights (removed depth dimension)
+        weight = torch.ones((self.channel, 1, weight_win_size, weight_win_size), 
+                           device=I.device, requires_grad=False)
+        conv_fn = F.conv2d  # Changed from conv3d to conv2d
+
+        # compute CC squares
+        I2 = I*I
+        J2 = J*J
+        IJ = I*J
+
+        # compute local sums via convolution
+        I_sum = conv_fn(I, weight, padding=int(win_size/2), groups=self.channel)
+        J_sum = conv_fn(J, weight, padding=int(win_size/2), groups=self.channel)
+        I2_sum = conv_fn(I2, weight, padding=int(win_size/2), groups=self.channel)
+        J2_sum = conv_fn(J2, weight, padding=int(win_size/2), groups=self.channel)
+        IJ_sum = conv_fn(IJ, weight, padding=int(win_size/2), groups=self.channel)
+
+        # compute cross correlation
+        win_size = np.prod(self.win)
+        u_I = I_sum/win_size
+        u_J = J_sum/win_size
+
+        cross = IJ_sum - u_J*I_sum - u_I*J_sum + u_I*u_J*win_size
+        I_var = I2_sum - 2 * u_I * I_sum + u_I*u_I*win_size
+        J_var = J2_sum - 2 * u_J * J_sum + u_J*u_J*win_size
+
+        cc = cross * cross / (I_var * J_var + self.eps)
+        
+        # return negative cc.
+        return -1.0 * torch.mean(cc)
+
+class multi_resolution_NCC_weight_2D(torch.nn.Module):
+    """
+    2D multi-resolution normalized cross correlation for DINO features
+    """
+    def __init__(self, win=None, eps=1e-5, scale=3, channel=1):
+        super(multi_resolution_NCC_weight_2D, self).__init__()
+        self.num_scale = scale
+        self.similarity_metric = []
+
+        for i in range(scale):
+            self.similarity_metric.append(NCC_weight_2D(win=win - (i*2), channel=channel))
+
+    def forward(self, I, J, weight_map):
+        total_NCC = []
+        
+        for i in range(self.num_scale):
+            current_NCC = self.similarity_metric[i](I, J, weight_map)
+            total_NCC.append(current_NCC/(2**i))
+            
+            # Changed from avg_pool3d to avg_pool2d
+            I = nn.functional.avg_pool2d(I, kernel_size=3, stride=2, padding=1, count_include_pad=False)
+            J = nn.functional.avg_pool2d(J, kernel_size=3, stride=2, padding=1, count_include_pad=False)
+            # weight_map = nn.functional.avg_pool2d(weight_map, kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+        return sum(total_NCC)
+
+class DINO_Cosine_Similarity(torch.nn.Module):
+    def __init__(self, focus_on_low_sim=False, visualization_step=100):
+        super(DINO_Cosine_Similarity, self).__init__()
+        self.focus_on_low_sim = focus_on_low_sim
+        # self.visualization_step = visualization_step
+        self.step_counter = 0
+
+    def forward(self, I, J):
+        self.step_counter += 1
+        
+        # Normalize features
+        I_norm = F.normalize(I, p=2, dim=1)
+        J_norm = F.normalize(J, p=2, dim=1)
+        
+        # Compute cosine similarity
+        cosine_sim = torch.sum(I_norm * J_norm, dim=1)  # [B, H, W]
+        
+        # --- Optional: Focus on low-similarity regions ---
+        if self.focus_on_low_sim:
+            # Give more weight to poorly aligned regions
+            weights = 1.0 - cosine_sim  # Low similarity → high weight
+            weights = weights.unsqueeze(1)  # [B, 1, H, W]
+            weighted_cosine = cosine_sim * weights.squeeze(1)
+            loss = -1.0 * torch.mean(weighted_cosine)
+        else:
+            loss = -1.0 * torch.mean(cosine_sim)
+        
+        # --- Visualization ---
+        # if self.step_counter % self.visualization_step == 0:
+            # self.visualize_similarity(cosine_sim, I, J)
+        
+        return loss
+
+    def visualize_similarity(self, cosine_sim, I, J):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Use first batch element
+        cos_map = cosine_sim[0].cpu().detach().numpy()
+        I_feat = I[0].mean(dim=0).cpu().detach().numpy()  # Mean across channels
+        J_feat = J[0].mean(dim=0).cpu().detach().numpy()
+        
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Feature maps
+        axes[0, 0].imshow(I_feat, cmap='viridis')
+        axes[0, 0].set_title('Warped Features (mean)')
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(J_feat, cmap='viridis')
+        axes[0, 1].set_title('Fixed Features (mean)')
+        axes[0, 1].axis('off')
+        
+        axes[0, 2].imshow(I_feat - J_feat, cmap='RdBu_r', vmin=-2, vmax=2)
+        axes[0, 2].set_title('Feature Difference')
+        axes[0, 2].axis('off')
+        
+        # Cosine similarity
+        im = axes[1, 0].imshow(cos_map, cmap='viridis', vmin=0, vmax=1)
+        axes[1, 0].set_title(f'Cosine Similarity\nmean: {cos_map.mean():.3f}')
+        axes[1, 0].axis('off')
+        plt.colorbar(im, ax=axes[1, 0])
+        
+        # Low similarity regions
+        low_sim_mask = (cos_map < 0.7)  # Threshold for poor alignment
+        axes[1, 1].imshow(cos_map, cmap='viridis', vmin=0, vmax=1)
+        axes[1, 1].imshow(low_sim_mask, cmap='Reds', alpha=0.3)
+        axes[1, 1].set_title(f'Low Similarity Regions\n({low_sim_mask.mean()*100:.1f}%)')
+        axes[1, 1].axis('off')
+        
+        # Histogram
+        axes[1, 2].hist(cos_map.flatten(), bins=50, alpha=0.7)
+        axes[1, 2].set_xlabel('Cosine Similarity')
+        axes[1, 2].set_ylabel('Count')
+        axes[1, 2].set_title('Similarity Distribution')
+        axes[1, 2].axvline(cos_map.mean(), color='red', linestyle='--', label=f'Mean: {cos_map.mean():.3f}')
+        axes[1, 2].legend()
+        
+        plt.suptitle(f'Step {self.step_counter} - DINO Cosine Similarity Analysis', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(f'cosine_similarity_step_{self.step_counter}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Saved cosine similarity visualization for step {self.step_counter}")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
+class DINO_Cosine_Loss(nn.Module):
+    """
+    Computes a loss based on the cosine similarity between two feature maps,
+    with optional masking and focal weighting.
+
+    The module can operate in two modes:
+    1.  Standard Mode: Calculates the mean cosine distance (1 - similarity).
+    2.  Focal Weighting Mode: Gives more weight to "hard" examples, i.e.,
+        feature locations with low similarity (high distance). This can help
+        the model focus on challenging regions during training.
+    """
+    def __init__(self, use_focal_weighting: bool = False, gamma: float = 2.0):
+        """
+        Initializes the DINO_Cosine_Loss module.
+
+        Args:
+            use_focal_weighting (bool, optional): If True, enables the focal weighting
+                mechanism. Defaults to False.
+            gamma (float, optional): The focusing parameter for focal weighting.
+                Only used if `use_focal_weighting` is True. Higher values (e.g., 2.0)
+                lead to a more aggressive focus on low-similarity regions.
+                Defaults to 2.0.
+        """
+        super(DINO_Cosine_Loss, self).__init__()
+        self.use_focal_weighting = use_focal_weighting
+        self.gamma = gamma
+
+    def forward(self, features_i: torch.Tensor, features_j: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Calculates the forward pass of the loss function.
+
+        Args:
+            features_i (torch.Tensor): The first feature tensor, with shape [B, C, H, W].
+            features_j (torch.Tensor): The second feature tensor, with shape [B, C, H, W].
+            mask (Optional[torch.Tensor], optional): A binary mask of shape [B, 1, H, W].
+                If provided, the loss is only computed over the regions where the mask is 1.
+                If None, the loss is computed over the entire feature map. Defaults to None.
+
+        Returns:
+            torch.Tensor: A scalar tensor representing the final computed loss.
+        """
+        # Step 1: Normalize the feature vectors along the channel dimension.
+        i_norm = F.normalize(features_i, p=2, dim=1)
+        j_norm = F.normalize(features_j, p=2, dim=1)
+        
+        # Step 2: Compute the cosine similarity map.
+        # Shape: [B, H, W], with values ranging from -1 (opposite) to 1 (identical).
+        cosine_sim_map = torch.sum(i_norm * j_norm, dim=1)
+
+        # Step 3: Convert similarity to distance map.
+        # Shape: [B, H, W], with values ranging from 0 (identical) to 2 (opposite).
+        cosine_dist_map = 1.0 - cosine_sim_map
+
+        # Step 4: Determine the base loss map, applying focal weighting if enabled.
+        if self.use_focal_weighting:
+            # Weight the distance by (distance^gamma).
+            # This amplifies the loss for regions with high distance (low similarity).
+            loss_map = torch.pow(cosine_dist_map, self.gamma) * cosine_dist_map
+        else:
+            # Standard mode: the loss map is simply the distance map.
+            loss_map = cosine_dist_map
+            
+        # Step 5: Compute the final loss, applying the mask if it exists.
+        if mask is not None:
+            # Ensure mask has the same B, H, W dimensions and a channel dim for broadcasting.
+            # The input mask is expected to be [B, 1, H, W]. We unsqueeze the loss_map to match.
+            masked_loss = loss_map.unsqueeze(1) * mask
+            
+            # Calculate the mean only over the masked elements.
+            # Add a small epsilon to the denominator for numerical stability.
+            final_loss = masked_loss.sum() / (mask.sum() + 1e-8)
+        else:
+            # If no mask is provided, compute the mean over the entire map.
+            final_loss = torch.mean(loss_map)
+            
+        return final_loss
+    
+# Or if you want multi-resolution:
+class MultiResolution_Cosine(torch.nn.Module):
+    def __init__(self, scale=3):
+        super(MultiResolution_Cosine, self).__init__()
+        self.num_scale = scale
+        self.similarity_metric = DINO_Cosine_Similarity()
+
+    def forward(self, I, J):
+        total_loss = 0
+        for i in range(self.num_scale):
+            current_loss = self.similarity_metric(I, J)
+            total_loss += current_loss / (2**i)
+            I = F.avg_pool2d(I, kernel_size=3, stride=2, padding=1)
+            J = F.avg_pool2d(J, kernel_size=3, stride=2, padding=1)
+        return total_loss
 
 class DemonsOrientation(nn.Module):
     def __init__(self, channel, alpha=1.0):
