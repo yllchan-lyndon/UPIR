@@ -5,7 +5,7 @@ import nibabel as nib
 from medpy.io import load
 import types
 from Functions import generate_grid, save_img, generate_grid_unit, transform_unit_flow_to_flow_cuda
-from cnn_swin import HybridEncoder, SwinTransformer, DecoderBlock, Conv3dReLU, RegistrationHead
+from cnn_swin import HybridEncoder, SwinTransformer, DecoderBlock, Conv3dReLU, RegistrationHead, SwinTransformerBlock
 import numpy as np
 
 import os
@@ -121,9 +121,551 @@ def get_transmorph_config():
     config.reg_head_chan = 16
     return config
 
-class UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1(nn.Module):
+
+class swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(nn.Module):
     def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, num_block=5):
-        super(UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1, self).__init__()
+        super(swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1, self).__init__()
+        self.in_channel = in_channel
+        self.n_classes = n_classes
+        self.start_channel = start_channel
+
+        self.range_flow = range_flow
+        self.is_train = is_train
+
+        self.imgshape = imgshape
+
+        self.grid_1 = generate_grid_unit(self.imgshape)
+        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
+
+        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
+        self.transform = SpatialTransform_unit().cuda()
+        # self.com_transform = CompositionTransform().cuda()
+
+        bias_opt = False
+
+        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
+
+        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
+        # self.input_encoder_lvl2 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
+        # self.input_encoder_lvl3 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
+
+        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
+        self.swin_block = SwinTransformerBlock(dim=self.start_channel * 4, num_heads=4)
+        # self.resblock_group_lvl2 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
+        # self.resblock_group_lvl3 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
+
+        # self.up = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
+                               padding=0, output_padding=0, bias=bias_opt)
+
+        self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_stress = self.stress_head(self.start_channel * 8, 6, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_mask = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        # self.output_lvl2 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
+        #                            bias=False)
+        # self.output_lvl3 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
+        #                            bias=False)
+
+
+        # for m in self.modules():
+        #     if isinstance(m, nn.Conv3d):
+        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+
+    def resblock_seq(self, in_channels, num_block, bias_opt=False):
+        blocks = []
+        for i in range(num_block):
+            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
+            blocks.append(nn.LeakyReLU(0.2))
+
+        layer = nn.ModuleList(blocks)
+        return layer
+
+
+    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU())
+        else:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
+        return layer
+
+    def decoder(self, in_channels, out_channels, kernel_size=2, stride=2, padding=0,
+                output_padding=0, bias=True):
+        layer = nn.Sequential(
+            nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride,
+                               padding=padding, output_padding=output_padding, bias=bias),
+            nn.ReLU())
+        return layer
+
+    def stress_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            # layer = nn.Sequential(
+            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+            #     nn.Tanh())
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+    
+    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
+        """Head to predict log-variance (uncertainty)."""
+        return nn.Sequential(
+            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+        )
+    
+    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            # layer = nn.Sequential(
+            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+            #     nn.Tanh())
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+
+    def forward(self, x, y, reg_code):
+
+        cat_input = torch.cat((x, y), 1)
+        cat_input = self.down_avg(cat_input)
+        cat_input_lvl1 = self.down_avg(cat_input)
+
+        down_y = cat_input_lvl1[:, 1:2, :, :, :]
+
+        fea_e0 = self.input_encoder_lvl1(cat_input_lvl1)
+        e0 = self.down_conv(fea_e0)
+        # Reshape for Swin block 
+        B, C2, H, W, D = e0.shape 
+        flattened = e0.permute(0, 2, 3, 4, 1).reshape(B, H * W * D, C2)
+        self.swin_block.H, self.swin_block.W, self.swin_block.T = H, W, D
+        refined_flat = self.swin_block(flattened, mask_matrix=None)
+        # Reshape back to 3D
+        e0 = refined_flat.reshape(B, H, W, D, C2).permute(0, 4, 1, 2, 3).contiguous()
+        # e0 = self.resblock_group_lvl1(e0)
+        for i in range(len(self.resblock_group_lvl1)):
+            if i % 2 == 0:
+                e0 = self.resblock_group_lvl1[i](e0, reg_code)
+            else:
+                e0 = self.resblock_group_lvl1[i](e0)
+
+        e0 = self.up(e0)
+        output_disp_e0_v = self.output_lvl1(torch.cat([e0, fea_e0], dim=1)) * self.range_flow
+        stress_field = self.output_stress(torch.cat([e0, fea_e0], dim=1))
+        output_uncertainty = self.output_mask(torch.cat([e0, fea_e0], dim=1))
+        # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
+        warpped_inputx_lvl1_out = self.transform(x, output_disp_e0_v.permute(0, 2, 3, 4, 1), self.grid_1)
+
+
+        if self.is_train is True:
+            return output_disp_e0_v, warpped_inputx_lvl1_out, down_y, output_disp_e0_v, e0, stress_field, output_uncertainty
+        else:
+            return output_disp_e0_v
+
+
+class swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(nn.Module):
+    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, model_lvl1=None, num_block=5):
+        super(swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2, self).__init__()
+        self.in_channel = in_channel
+        self.n_classes = n_classes
+        self.start_channel = start_channel
+
+        self.range_flow = range_flow
+        self.is_train = is_train
+
+        self.imgshape = imgshape
+
+        self.model_lvl1 = model_lvl1
+        # self.model_lvl1 = [model_lvl1[i] for i in range(len(model_lvl1)-1)]
+        # self.model_lvl1 = nn.Sequential(*self.model_lvl1)
+
+        self.grid_1 = generate_grid_unit(self.imgshape)
+        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
+
+        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
+        self.transform = SpatialTransform_unit().cuda()
+        self.com_transform = CompositionTransform_unit().cuda()
+
+        bias_opt = False
+
+        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel+3, self.start_channel * 4, bias=bias_opt)
+
+        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
+        # self.input_encoder_lvl2 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
+        # self.input_encoder_lvl3 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
+
+        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
+        self.swin_block = SwinTransformerBlock(dim=self.start_channel * 4, num_heads=4)
+        # self.resblock_group_lvl2 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
+        # self.resblock_group_lvl3 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
+
+        self.up_tri = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
+                                     padding=0, output_padding=0, bias=bias_opt)
+
+        self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_stress = self.stress_head(self.start_channel * 8, 6, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_mask = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
+
+        # self.output_lvl2 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
+        #                            bias=False)
+        # self.output_lvl3 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
+        #                            bias=False)
+
+        # for m in self.modules():
+        #     if isinstance(m, nn.Conv3d):
+        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+    def unfreeze_modellvl1(self):
+        # unFreeze model_lvl1 weight
+        print("\nunfreeze model_lvl1 parameter")
+        for param in self.model_lvl1.parameters():
+            param.requires_grad = True
+
+    def resblock_seq(self, in_channels, num_block, bias_opt=False):
+        blocks = []
+        for i in range(num_block):
+            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
+            blocks.append(nn.LeakyReLU(0.2))
+
+        layer = nn.ModuleList(blocks)
+        return layer
+
+    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                              bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU())
+        else:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
+        return layer
+
+    def decoder(self, in_channels, out_channels, kernel_size=2, stride=2, padding=0,
+                output_padding=0, bias=True):
+        layer = nn.Sequential(
+            nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride,
+                               padding=padding, output_padding=output_padding, bias=bias),
+            nn.ReLU())
+        return layer
+    
+    def stress_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            # layer = nn.Sequential(
+            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+            #     nn.Tanh())
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+    
+    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
+        """Head to predict log-variance (uncertainty)."""
+        return nn.Sequential(
+            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+        )
+        
+    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            # layer = nn.Sequential(
+            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+            #     nn.Tanh())
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+
+    def forward(self, x, y, reg_code):
+        # output_disp_e0, warpped_inputx_lvl1_out, down_y, output_disp_e0_v, e0
+        lvl1_disp, _, _, lvl1_v, lvl1_embedding, stress_field, output_uncertainty = self.model_lvl1(x, y, reg_code)
+
+        # lvl1_disp, lvl1_warp, lvl1_y, lvl1_v, lvl1_embedding = self.model_lvl1(x, y, reg_code)
+        lvl1_disp_up = self.up_tri(lvl1_disp)
+        stress_field_lvl1 = self.up_tri(stress_field)
+        output_uncertainty_lvl1 = self.up_tri(output_uncertainty)
+
+        x_down = self.down_avg(x)
+        y_down = self.down_avg(y)
+
+        warpped_x = self.transform(x_down, lvl1_disp_up.permute(0, 2, 3, 4, 1), self.grid_1)
+
+        cat_input_lvl2 = torch.cat((warpped_x, y_down, lvl1_disp_up), 1)
+
+        fea_e0 = self.input_encoder_lvl1(cat_input_lvl2)
+        e0 = self.down_conv(fea_e0)
+
+        e0 = e0 + lvl1_embedding
+                # Reshape for Swin block 
+        B, C2, H, W, D = e0.shape 
+        flattened = e0.permute(0, 2, 3, 4, 1).reshape(B, H * W * D, C2)
+        self.swin_block.H, self.swin_block.W, self.swin_block.T = H, W, D
+        refined_flat = self.swin_block(flattened, mask_matrix=None)
+        # Reshape back to 3D
+        e0 = refined_flat.reshape(B, H, W, D, C2).permute(0, 4, 1, 2, 3).contiguous()
+
+        # e0 = self.resblock_group_lvl1(e0)
+        for i in range(len(self.resblock_group_lvl1)):
+            if i % 2 == 0:
+                e0 = self.resblock_group_lvl1[i](e0, reg_code)
+            else:
+                e0 = self.resblock_group_lvl1[i](e0)
+
+        e0 = self.up(e0)
+        output_disp_e0_v = self.output_lvl1(torch.cat([e0, fea_e0], dim=1)) * self.range_flow
+        stress_field_lvl2 = self.output_stress(torch.cat([e0, fea_e0], dim=1))
+        output_uncertainty_lvl2 = self.output_mask(torch.cat([e0, fea_e0], dim=1))
+        # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
+        compose_field_e0_lvl1 = lvl1_disp_up + output_disp_e0_v
+        stress_field = stress_field_lvl1 + stress_field_lvl2
+        output_uncertainty = output_uncertainty_lvl1 + output_uncertainty_lvl2
+        warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
+
+        if self.is_train is True:
+            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y_down, output_disp_e0_v, lvl1_v, e0, stress_field, output_uncertainty
+            # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y_down, output_disp_e0_v, lvl1_v, e0, lvl1_warp, lvl1_y
+        else:
+            return compose_field_e0_lvl1
+
+
+class swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
+    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4,
+                 model_lvl2=None, num_block=5):
+        super(swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, self).__init__()
+        self.in_channel = in_channel
+        self.n_classes = n_classes
+        self.start_channel = start_channel
+
+        self.range_flow = range_flow
+        self.is_train = is_train
+
+        self.imgshape = imgshape
+
+        self.model_lvl2 = model_lvl2
+
+        self.grid_1 = generate_grid_unit(self.imgshape)
+        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
+
+        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
+        self.transform = SpatialTransform_unit().cuda()
+        self.com_transform = CompositionTransform_unit().cuda()
+
+        bias_opt = False
+
+        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel+3, self.start_channel * 4, bias=bias_opt)
+        # self.encoder = HybridEncoder(config)
+
+        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
+
+        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
+        self.swin_block = SwinTransformerBlock(dim=self.start_channel * 4, num_heads=4)
+
+
+        self.up_tri = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
+                                     padding=0, output_padding=0, bias=bias_opt)
+
+        # self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_stress = self.stress_head(self.start_channel * 8, 6, kernel_size=3, stride=1, padding=1, bias=False)
+        self.output_mask = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
+
+
+        # for m in self.modules():
+        #     if isinstance(m, nn.Conv3d):
+        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+    def unfreeze_modellvl2(self):
+        # unFreeze model_lvl1 weight
+        print("\nunfreeze model_lvl2 parameter")
+        for param in self.model_lvl2.parameters():
+            param.requires_grad = True
+
+    def resblock_seq(self, in_channels, num_block, bias_opt=False):
+        blocks = []
+        for i in range(num_block):
+            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
+            blocks.append(nn.LeakyReLU(0.2))
+
+        layer = nn.ModuleList(blocks)
+        return layer
+
+    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                              bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU())
+        else:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
+        return layer
+
+    def decoder(self, in_channels, out_channels, kernel_size=2, stride=2, padding=0,
+                output_padding=0, bias=True):
+        layer = nn.Sequential(
+            nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride,
+                               padding=padding, output_padding=output_padding, bias=bias),
+            nn.ReLU())
+        return layer
+    
+    def stress_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            # layer = nn.Sequential(
+            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+            #     nn.Tanh())
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+
+    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                bias=False, batchnorm=False):
+        if batchnorm:
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.BatchNorm3d(out_channels),
+                nn.Tanh())
+        else:
+            # layer = nn.Sequential(
+            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+            #     nn.Tanh())
+            layer = nn.Sequential(
+                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+                nn.Softsign())
+        return layer
+
+    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
+        """Head to predict log-variance (uncertainty)."""
+        return nn.Sequential(
+            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
+        )
+
+    def forward(self, x, y, reg_code):
+        # compose_field_e0_lvl1, warpped_inputx_lvl1_out, down_y, output_disp_e0_v, lvl1_v, e0
+        lvl2_disp, _, _, lvl2_v, lvl1_v, lvl2_embedding, stress_field, output_uncertainty = self.model_lvl2(x, y, reg_code)
+
+        # lvl2_disp, lvl2_warp, lvl2_y, lvl2_v, lvl1_v, lvl2_embedding, lvl1_warp, lvl1_y = self.model_lvl2(x, y, reg_code)
+
+
+        lvl2_disp_up = self.up_tri(lvl2_disp)
+        stress_field_lvl2 = self.up_tri(stress_field)
+        output_uncertainty_lvl2 = self.up_tri(output_uncertainty)
+        warpped_x = self.transform(x, lvl2_disp_up.permute(0, 2, 3, 4, 1), self.grid_1)
+
+        cat_input = torch.cat((warpped_x, y, lvl2_disp_up), 1)
+
+        fea_e0 = self.input_encoder_lvl1(cat_input)
+        # fea_e0, _, _ = self.encoder(cat_input)
+        e0 = self.down_conv(fea_e0)
+        # print(e0.shape, lvl2_embedding.shape)
+        e0 = e0 + lvl2_embedding
+        # Reshape for Swin block 
+        B, C2, H, W, D = e0.shape 
+        flattened = e0.permute(0, 2, 3, 4, 1).reshape(B, H * W * D, C2)
+        self.swin_block.H, self.swin_block.W, self.swin_block.T = H, W, D
+        refined_flat = self.swin_block(flattened, mask_matrix=None)
+        # Reshape back to 3D
+        e0 = refined_flat.reshape(B, H, W, D, C2).permute(0, 4, 1, 2, 3).contiguous()
+
+        # e0 = self.resblock_group_lvl1(e0)
+        for i in range(len(self.resblock_group_lvl1)):
+            if i % 2 == 0:
+                e0 = self.resblock_group_lvl1[i](e0, reg_code)
+            else:
+                e0 = self.resblock_group_lvl1[i](e0)
+
+        e0 = self.up(e0)
+        # fea_e0 = self.up(fea_e0)
+        shared_features = torch.cat([e0, fea_e0], dim=1)
+        output_disp_e0_v = self.output_lvl1(shared_features) * self.range_flow
+        # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
+        compose_field_e0_lvl1 = output_disp_e0_v + lvl2_disp_up
+
+        warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
+        
+        # Head 2: Stress (Physics Expert)
+        predicted_stress = self.output_stress(shared_features)
+        predicted_stress = stress_field_lvl2 + predicted_stress
+
+        # Head 3: Mask (Attention Expert)
+        predicted_mask = self.output_mask(shared_features)
+        predicted_mask = output_uncertainty_lvl2 + predicted_mask
+        # print(predicted_mask.shape, predicted_stress.shape)
+
+        if self.is_train is True:
+            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0, predicted_stress, predicted_mask
+            # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_v, e0, lvl1_warp, lvl1_y, lvl2_warp, lvl2_y
+        else:
+            return compose_field_e0_lvl1
+        
+class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(nn.Module):
+    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, num_block=5):
+        super(Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1, self).__init__()
         self.in_channel = in_channel
         self.n_classes = n_classes
         self.start_channel = start_channel
@@ -280,9 +822,9 @@ class UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1(nn.Module):
             return output_disp_e0_v
 
 
-class UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2(nn.Module):
+class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(nn.Module):
     def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, model_lvl1=None, num_block=5):
-        super(UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2, self).__init__()
+        super(Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2, self).__init__()
         self.in_channel = in_channel
         self.n_classes = n_classes
         self.start_channel = start_channel
@@ -460,10 +1002,10 @@ class UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2(nn.Module):
             return compose_field_e0_lvl1
 
 
-class UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
+class Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
     def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4,
                  model_lvl2=None, num_block=5):
-        super(UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3, self).__init__()
+        super(Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, self).__init__()
         self.in_channel = in_channel
         self.n_classes = n_classes
         self.start_channel = start_channel
@@ -635,512 +1177,6 @@ class UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
 
         if self.is_train is True:
             return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0, predicted_stress, predicted_mask
-            # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_v, e0, lvl1_warp, lvl1_y, lvl2_warp, lvl2_y
-        else:
-            return compose_field_e0_lvl1
-        
-class nophy_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(nn.Module):
-    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, num_block=5):
-        super(nophy_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1, self).__init__()
-        self.in_channel = in_channel
-        self.n_classes = n_classes
-        self.start_channel = start_channel
-
-        self.range_flow = range_flow
-        self.is_train = is_train
-
-        self.imgshape = imgshape
-
-        self.grid_1 = generate_grid_unit(self.imgshape)
-        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
-
-        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
-        self.transform = SpatialTransform_unit().cuda()
-        # self.com_transform = CompositionTransform().cuda()
-
-        bias_opt = False
-
-        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
-
-        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
-        # self.input_encoder_lvl2 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
-        # self.input_encoder_lvl3 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
-
-        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
-        # self.resblock_group_lvl2 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
-        # self.resblock_group_lvl3 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
-
-        # self.up = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
-        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
-                               padding=0, output_padding=0, bias=bias_opt)
-
-        self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
-
-        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.output_mask = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        # self.output_lvl2 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
-        #                            bias=False)
-        # self.output_lvl3 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
-        #                            bias=False)
-
-
-        # for m in self.modules():
-        #     if isinstance(m, nn.Conv3d):
-        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-
-
-    def resblock_seq(self, in_channels, num_block, bias_opt=False):
-        blocks = []
-        for i in range(num_block):
-            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
-            blocks.append(nn.LeakyReLU(0.2))
-
-        layer = nn.ModuleList(blocks)
-        return layer
-
-
-    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.ReLU())
-        else:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
-        return layer
-
-    def decoder(self, in_channels, out_channels, kernel_size=2, stride=2, padding=0,
-                output_padding=0, bias=True):
-        layer = nn.Sequential(
-            nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride,
-                               padding=padding, output_padding=output_padding, bias=bias),
-            nn.ReLU())
-        return layer
-
-    def stress_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.Tanh())
-        else:
-            # layer = nn.Sequential(
-            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-            #     nn.Tanh())
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.Softsign())
-        return layer
-    
-    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
-        """Head to predict log-variance (uncertainty)."""
-        return nn.Sequential(
-            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-            nn.LeakyReLU(0.2),
-            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-        )
-    
-    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.Tanh())
-        else:
-            # layer = nn.Sequential(
-            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-            #     nn.Tanh())
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.Softsign())
-        return layer
-
-    def forward(self, x, y, reg_code):
-
-        cat_input = torch.cat((x, y), 1)
-        cat_input = self.down_avg(cat_input)
-        cat_input_lvl1 = self.down_avg(cat_input)
-
-        down_y = cat_input_lvl1[:, 1:2, :, :, :]
-
-        fea_e0 = self.input_encoder_lvl1(cat_input_lvl1)
-        e0 = self.down_conv(fea_e0)
-
-        # e0 = self.resblock_group_lvl1(e0)
-        for i in range(len(self.resblock_group_lvl1)):
-            if i % 2 == 0:
-                e0 = self.resblock_group_lvl1[i](e0, reg_code)
-            else:
-                e0 = self.resblock_group_lvl1[i](e0)
-
-        e0 = self.up(e0)
-        output_disp_e0_v = self.output_lvl1(torch.cat([e0, fea_e0], dim=1)) * self.range_flow
-        output_uncertainty = self.output_mask(torch.cat([e0, fea_e0], dim=1))
-        # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
-        warpped_inputx_lvl1_out = self.transform(x, output_disp_e0_v.permute(0, 2, 3, 4, 1), self.grid_1)
-
-
-        if self.is_train is True:
-            return output_disp_e0_v, warpped_inputx_lvl1_out, down_y, output_disp_e0_v, e0, output_uncertainty
-        else:
-            return output_disp_e0_v
-
-
-class nophy_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(nn.Module):
-    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4, model_lvl1=None, num_block=5):
-        super(nophy_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2, self).__init__()
-        self.in_channel = in_channel
-        self.n_classes = n_classes
-        self.start_channel = start_channel
-
-        self.range_flow = range_flow
-        self.is_train = is_train
-
-        self.imgshape = imgshape
-
-        self.model_lvl1 = model_lvl1
-        # self.model_lvl1 = [model_lvl1[i] for i in range(len(model_lvl1)-1)]
-        # self.model_lvl1 = nn.Sequential(*self.model_lvl1)
-
-        self.grid_1 = generate_grid_unit(self.imgshape)
-        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
-
-        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
-        self.transform = SpatialTransform_unit().cuda()
-        self.com_transform = CompositionTransform_unit().cuda()
-
-        bias_opt = False
-
-        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel+3, self.start_channel * 4, bias=bias_opt)
-
-        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
-        # self.input_encoder_lvl2 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
-        # self.input_encoder_lvl3 = self.input_feature_extract(self.in_channel, self.start_channel * 4, bias=bias_opt)
-
-        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
-        # self.resblock_group_lvl2 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
-        # self.resblock_group_lvl3 = self.resblock_seq(self.start_channel * 4, bias_opt=bias_opt)
-
-        self.up_tri = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
-        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
-                                     padding=0, output_padding=0, bias=bias_opt)
-
-        self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
-
-        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.output_mask = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
-
-        # self.output_lvl2 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
-        #                            bias=False)
-        # self.output_lvl3 = self.outputs(self.start_channel * 4, self.n_classes, kernel_size=5, stride=1, padding=2,
-        #                            bias=False)
-
-        # for m in self.modules():
-        #     if isinstance(m, nn.Conv3d):
-        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-
-    def unfreeze_modellvl1(self):
-        # unFreeze model_lvl1 weight
-        print("\nunfreeze model_lvl1 parameter")
-        for param in self.model_lvl1.parameters():
-            param.requires_grad = True
-
-    def resblock_seq(self, in_channels, num_block, bias_opt=False):
-        blocks = []
-        for i in range(num_block):
-            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
-            blocks.append(nn.LeakyReLU(0.2))
-
-        layer = nn.ModuleList(blocks)
-        return layer
-
-    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
-                              bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.ReLU())
-        else:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
-        return layer
-
-    def decoder(self, in_channels, out_channels, kernel_size=2, stride=2, padding=0,
-                output_padding=0, bias=True):
-        layer = nn.Sequential(
-            nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride,
-                               padding=padding, output_padding=output_padding, bias=bias),
-            nn.ReLU())
-        return layer
-    
-    def stress_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.Tanh())
-        else:
-            # layer = nn.Sequential(
-            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-            #     nn.Tanh())
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.Softsign())
-        return layer
-    
-    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
-        """Head to predict log-variance (uncertainty)."""
-        return nn.Sequential(
-            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-            nn.LeakyReLU(0.2),
-            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-        )
-        
-    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.Tanh())
-        else:
-            # layer = nn.Sequential(
-            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-            #     nn.Tanh())
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.Softsign())
-        return layer
-
-    def forward(self, x, y, reg_code):
-        # output_disp_e0, warpped_inputx_lvl1_out, down_y, output_disp_e0_v, e0
-        lvl1_disp, _, _, lvl1_v, lvl1_embedding, output_uncertainty = self.model_lvl1(x, y, reg_code)
-
-        # lvl1_disp, lvl1_warp, lvl1_y, lvl1_v, lvl1_embedding = self.model_lvl1(x, y, reg_code)
-        lvl1_disp_up = self.up_tri(lvl1_disp)
-        output_uncertainty_lvl1 = self.up_tri(output_uncertainty)
-
-        x_down = self.down_avg(x)
-        y_down = self.down_avg(y)
-
-        warpped_x = self.transform(x_down, lvl1_disp_up.permute(0, 2, 3, 4, 1), self.grid_1)
-
-        cat_input_lvl2 = torch.cat((warpped_x, y_down, lvl1_disp_up), 1)
-
-        fea_e0 = self.input_encoder_lvl1(cat_input_lvl2)
-        e0 = self.down_conv(fea_e0)
-
-        e0 = e0 + lvl1_embedding
-
-        # e0 = self.resblock_group_lvl1(e0)
-        for i in range(len(self.resblock_group_lvl1)):
-            if i % 2 == 0:
-                e0 = self.resblock_group_lvl1[i](e0, reg_code)
-            else:
-                e0 = self.resblock_group_lvl1[i](e0)
-
-        e0 = self.up(e0)
-        output_disp_e0_v = self.output_lvl1(torch.cat([e0, fea_e0], dim=1)) * self.range_flow
-        output_uncertainty_lvl2 = self.output_mask(torch.cat([e0, fea_e0], dim=1))
-        # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
-        compose_field_e0_lvl1 = lvl1_disp_up + output_disp_e0_v
-        output_uncertainty = output_uncertainty_lvl1 + output_uncertainty_lvl2
-        warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
-
-        if self.is_train is True:
-            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y_down, output_disp_e0_v, lvl1_v, e0, output_uncertainty
-            # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y_down, output_disp_e0_v, lvl1_v, e0, lvl1_warp, lvl1_y
-        else:
-            return compose_field_e0_lvl1
-
-
-class nophy_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(nn.Module):
-    def __init__(self, in_channel, n_classes, start_channel, is_train=True, imgshape=(160, 192, 144), range_flow=0.4,
-                 model_lvl2=None, num_block=5):
-        super(nophy_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, self).__init__()
-        self.in_channel = in_channel
-        self.n_classes = n_classes
-        self.start_channel = start_channel
-
-        self.range_flow = range_flow
-        self.is_train = is_train
-
-        self.imgshape = imgshape
-
-        self.model_lvl2 = model_lvl2
-
-        self.grid_1 = generate_grid_unit(self.imgshape)
-        self.grid_1 = torch.from_numpy(np.reshape(self.grid_1, (1,) + self.grid_1.shape)).cuda().float()
-
-        self.diff_transform = DiffeomorphicTransform_unit(time_step=7).cuda()
-        self.transform = SpatialTransform_unit().cuda()
-        self.com_transform = CompositionTransform_unit().cuda()
-
-        bias_opt = False
-
-        self.input_encoder_lvl1 = self.input_feature_extract(self.in_channel+3, self.start_channel * 4, bias=bias_opt)
-        # self.encoder = HybridEncoder(config)
-
-        self.down_conv = nn.Conv3d(self.start_channel * 4, self.start_channel * 4, 3, stride=2, padding=1, bias=bias_opt)
-
-        self.resblock_group_lvl1 = self.resblock_seq(self.start_channel * 4, num_block=num_block, bias_opt=bias_opt)
-
-
-        self.up_tri = torch.nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
-        self.up = nn.ConvTranspose3d(self.start_channel * 4, self.start_channel * 4, 2, stride=2,
-                                     padding=0, output_padding=0, bias=bias_opt)
-
-        # self.down_avg = nn.AvgPool3d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
-
-        self.output_lvl1 = self.outputs(self.start_channel * 8, self.n_classes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.output_mask = self.uncertainty_head(self.start_channel * 8, 1, kernel_size=3, stride=1, padding=1, bias=False)
-
-
-        # for m in self.modules():
-        #     if isinstance(m, nn.Conv3d):
-        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-
-    def unfreeze_modellvl2(self):
-        # unFreeze model_lvl1 weight
-        print("\nunfreeze model_lvl2 parameter")
-        for param in self.model_lvl2.parameters():
-            param.requires_grad = True
-
-    def resblock_seq(self, in_channels, num_block, bias_opt=False):
-        blocks = []
-        for i in range(num_block):
-            blocks.append(PreActBlock_AdaIn(in_channels, in_channels, bias=bias_opt))
-            blocks.append(nn.LeakyReLU(0.2))
-
-        layer = nn.ModuleList(blocks)
-        return layer
-
-    def input_feature_extract(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
-                              bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.ReLU())
-        else:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias))
-        return layer
-
-    def decoder(self, in_channels, out_channels, kernel_size=2, stride=2, padding=0,
-                output_padding=0, bias=True):
-        layer = nn.Sequential(
-            nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride,
-                               padding=padding, output_padding=output_padding, bias=bias),
-            nn.ReLU())
-        return layer
-    
-    def stress_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.Tanh())
-        else:
-            # layer = nn.Sequential(
-            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-            #     nn.Tanh())
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.Softsign())
-        return layer
-
-    def outputs(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
-                bias=False, batchnorm=False):
-        if batchnorm:
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.BatchNorm3d(out_channels),
-                nn.Tanh())
-        else:
-            # layer = nn.Sequential(
-            #     nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-            #     nn.Tanh())
-            layer = nn.Sequential(
-                nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.LeakyReLU(0.2),
-                nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-                nn.Softsign())
-        return layer
-
-    def uncertainty_head(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False):
-        """Head to predict log-variance (uncertainty)."""
-        return nn.Sequential(
-            nn.Conv3d(in_channels, int(in_channels/2), kernel_size, stride=stride, padding=padding, bias=bias),
-            nn.LeakyReLU(0.2),
-            nn.Conv3d(int(in_channels/2), out_channels, kernel_size, stride=stride, padding=padding, bias=bias),
-        )
-
-    def forward(self, x, y, reg_code):
-        # compose_field_e0_lvl1, warpped_inputx_lvl1_out, down_y, output_disp_e0_v, lvl1_v, e0
-        lvl2_disp, _, _, lvl2_v, lvl1_v, lvl2_embedding, output_uncertainty = self.model_lvl2(x, y, reg_code)
-
-        # lvl2_disp, lvl2_warp, lvl2_y, lvl2_v, lvl1_v, lvl2_embedding, lvl1_warp, lvl1_y = self.model_lvl2(x, y, reg_code)
-
-
-        lvl2_disp_up = self.up_tri(lvl2_disp)
-        output_uncertainty_lvl2 = self.up_tri(output_uncertainty)
-        warpped_x = self.transform(x, lvl2_disp_up.permute(0, 2, 3, 4, 1), self.grid_1)
-
-        cat_input = torch.cat((warpped_x, y, lvl2_disp_up), 1)
-
-        fea_e0 = self.input_encoder_lvl1(cat_input)
-        # fea_e0, _, _ = self.encoder(cat_input)
-        e0 = self.down_conv(fea_e0)
-        # print(e0.shape, lvl2_embedding.shape)
-        e0 = e0 + lvl2_embedding
-
-        # e0 = self.resblock_group_lvl1(e0)
-        for i in range(len(self.resblock_group_lvl1)):
-            if i % 2 == 0:
-                e0 = self.resblock_group_lvl1[i](e0, reg_code)
-            else:
-                e0 = self.resblock_group_lvl1[i](e0)
-
-        e0 = self.up(e0)
-        # fea_e0 = self.up(fea_e0)
-        shared_features = torch.cat([e0, fea_e0], dim=1)
-        output_disp_e0_v = self.output_lvl1(shared_features) * self.range_flow
-        # output_disp_e0 = self.diff_transform(output_disp_e0_v, self.grid_1)
-        compose_field_e0_lvl1 = output_disp_e0_v + lvl2_disp_up
-
-        warpped_inputx_lvl1_out = self.transform(x, compose_field_e0_lvl1.permute(0, 2, 3, 4, 1), self.grid_1)
-
-        # Head 3: Mask (Attention Expert)
-        predicted_mask = self.output_mask(shared_features)
-        predicted_mask = output_uncertainty_lvl2 + predicted_mask
-        # print(predicted_mask.shape, predicted_stress.shape)
-
-        if self.is_train is True:
-            return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_disp, e0, predicted_mask
             # return compose_field_e0_lvl1, warpped_inputx_lvl1_out, y, output_disp_e0_v, lvl1_v, lvl2_v, e0, lvl1_warp, lvl1_y, lvl2_warp, lvl2_y
         else:
             return compose_field_e0_lvl1
@@ -2650,6 +2686,70 @@ class multi_resolution_NGF(torch.nn.Module):
             I = nn.functional.avg_pool3d(I, kernel_size=3, stride=2, padding=1, count_include_pad=False)
             J = nn.functional.avg_pool3d(J, kernel_size=3, stride=2, padding=1, count_include_pad=False)
         return sum(total_NGF)
+
+
+class mindssc_loss(torch.nn.Module):
+    """
+    local (over window) normalized cross correlation
+    """
+    def __init__(self, delta=1, sigma=0.8):
+        super(mindssc_loss, self).__init__()
+        self.delta = delta
+        self.sigma = sigma
+
+    # learn2reg, delta=3, sigma=3
+    def mindssc(self, img, delta=1, sigma=0.8):
+        # see http://mpheinrich.de/pub/miccai2013_943_mheinrich.pdf for details on the MIND-SSC descriptor
+
+        device = img.device
+
+        # define start and end locations for self-similarity pattern
+        six_neighbourhood = torch.tensor([[0, 1, 1],
+                                          [1, 1, 0],
+                                          [1, 0, 1],
+                                          [1, 1, 2],
+                                          [2, 1, 1],
+                                          [1, 2, 1]], dtype=torch.float, device=device)
+
+        # squared distances
+        dist = pdist(six_neighbourhood.unsqueeze(0)).squeeze(0)
+
+        # define comparison mask
+        x, y = torch.meshgrid(torch.arange(6, device=device), torch.arange(6, device=device))
+        mask = ((x > y).view(-1) & (dist == 2).view(-1))
+
+        # build kernel
+        idx_shift1 = six_neighbourhood.unsqueeze(1).repeat(1, 6, 1).view(-1, 3)[mask, :].long()
+        idx_shift2 = six_neighbourhood.unsqueeze(0).repeat(6, 1, 1).view(-1, 3)[mask, :].long()
+        mshift1 = torch.zeros((12, 1, 3, 3, 3), device=device)
+        mshift1.view(-1)[
+            torch.arange(12, device=device) * 27 + idx_shift1[:, 0] * 9 + idx_shift1[:, 1] * 3 + idx_shift1[:,
+                                                                                                 2]] = 1
+        mshift2 = torch.zeros((12, 1, 3, 3, 3), device=device)
+        mshift2.view(-1)[
+            torch.arange(12, device=device) * 27 + idx_shift2[:, 0] * 9 + idx_shift2[:, 1] * 3 + idx_shift2[:,
+                                                                                                 2]] = 1
+        rpad = nn.ReplicationPad3d(delta)
+
+        # compute patch-ssd
+        ssd = smooth(
+            ((F.conv3d(rpad(img), mshift1, dilation=delta) - F.conv3d(rpad(img), mshift2, dilation=delta)) ** 2),
+            sigma)
+
+        # MIND equation
+        mind = ssd - torch.min(ssd, 1, keepdim=True)[0]
+        mind_var = torch.mean(mind, 1, keepdim=True)
+        mind_var = torch.clamp(mind_var, mind_var.mean() * 0.001, mind_var.mean() * 1000)
+        mind /= mind_var
+        mind = torch.exp(-mind)
+
+        # permute to have same ordering as C++ code
+        mind = mind[:, torch.tensor([6, 8, 1, 11, 2, 10, 0, 7, 9, 4, 5, 3], dtype=torch.long), :, :, :]
+
+        return mind
+
+    def forward(self, x, y):
+        return torch.mean((self.mindssc(x, delta=self.delta, sigma=self.sigma) - self.mindssc(y, delta=self.delta, sigma=self.sigma))**2)
 
 
 class MSE(torch.nn.Module):

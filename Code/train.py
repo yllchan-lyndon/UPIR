@@ -16,10 +16,9 @@ from sklearn.model_selection import KFold
 
 from Functions import Dataset_bratsreg_bidirection, Validation_Brats, \
     generate_grid_unit
-from bratsreg_model_stage import Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1, \
-    Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2, Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, Miccai2021_LDR_laplacian_TransMorph_lvl3, uncern_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3,\
-    SpatialTransform_unit, smoothloss, multi_resolution_NCC_weight, multi_resolution_NCC_weight_2D, MultiResolution_Cosine, DINO_Cosine_Similarity, DINO_Cosine_Loss, SpecialistHead
-from cnn_swin import Dual_FusionMorph
+from bratsreg_model_stage import UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1, \
+    UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2, UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3, \
+    SpatialTransform_unit, smoothloss, multi_resolution_NCC_weight, DINO_Cosine_Loss
 
 # from transformers import AutoImageProcessor, AutoModel
 
@@ -88,7 +87,7 @@ def save_visualizations(source_image, fixed_image, warped_image, uncertainty_map
 parser = ArgumentParser()
 parser.add_argument("--modelname", type=str,
                     dest="modelname",
-                    default='Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_',
+                    default='UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_',
                     help="Model name")
 parser.add_argument("--lr", type=float,
                     dest="lr", default=1e-4, help="learning rate")
@@ -575,15 +574,15 @@ def train():
         train_fixed.extend([fixed_t1ce_list[i] for i in train_only_indices])
         train_moving.extend([moving_t1ce_list[i] for i in train_only_indices])
     
-        model_lvl1 = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(2, 3, start_channel, is_train=True,
+        model_lvl1 = UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1(2, 3, start_channel, is_train=True,
                                                                     imgshape=imgshape_4,
                                                                     range_flow=range_flow, num_block=num_cblock).cuda()
-        model_lvl2 = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(2, 3, start_channel, is_train=True,
+        model_lvl2 = UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2(2, 3, start_channel, is_train=True,
                                                                     imgshape=imgshape_2,
                                                                     range_flow=range_flow, model_lvl1=model_lvl1,
                                                                     num_block=num_cblock).cuda()
 
-        model = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(2, 3, start_channel, is_train=True, imgshape=imgshape,
+        model = UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3(2, 3, start_channel, is_train=True, imgshape=imgshape,
                                                                 range_flow=range_flow, model_lvl2=model_lvl2,
                                                                 num_block=num_cblock).cuda()
         # model = Miccai2021_LDR_laplacian_TransMorph_lvl3(is_train=True, imgshape=imgshape,
@@ -659,16 +658,16 @@ def train():
 
         step = 0
         if fold ==0:
-            load_model = True
+            load_model = False
         else:
             load_model = False
         if load_model is True:
-            model_path = "/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/1Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_72000.pth"
+            model_path = "/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/1UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_72000.pth"
             print("Loading weight: ", model_path)
             step = 72000
             model.load_state_dict(torch.load(model_path))
             # specialist_head.load_state_dict(torch.load(os.path.join(model_dir, f'specialist_head_step_{step}.pth')))
-            temp_lossall = np.load("/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/loss1Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_72000.npy")
+            temp_lossall = np.load("/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/loss1UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_72000.npy")
             lossall[:, 0:72000] = temp_lossall[:, 0:72000]
 
         # Add sigmoid activation to ensure uncertainty is in [0,1]
