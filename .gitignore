@@ -1,6 +1,8 @@
 /Data/
 /Model/
 /Log/
+
+# Ignore specific Python scripts
 /Code/BRATS_test_DIRAC_D.py
 /Code/BRATS_test_DIRAC.py
 /Code/BRATS_train_DIRAC_D.py
