@@ -16,8 +16,8 @@ from sklearn.model_selection import KFold
 
 from Functions import Dataset_bratsreg_bidirection, Validation_Brats, \
     generate_grid_unit
-from bratsreg_model_stage import Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1, \
-    Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2, Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, Miccai2021_LDR_laplacian_TransMorph_lvl3, uncern_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3,\
+from bratsreg import swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1, \
+    swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2, swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3, uncern_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3,\
     SpatialTransform_unit, smoothloss, multi_resolution_NCC_weight, multi_resolution_NCC_weight_2D, MultiResolution_Cosine, DINO_Cosine_Similarity, DINO_Cosine_Loss, SpecialistHead
 from cnn_swin import Dual_FusionMorph
 
@@ -88,7 +88,7 @@ def save_visualizations(source_image, fixed_image, warped_image, uncertainty_map
 parser = ArgumentParser()
 parser.add_argument("--modelname", type=str,
                     dest="modelname",
-                    default='Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_',
+                    default='sw_Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_',
                     help="Model name")
 parser.add_argument("--lr", type=float,
                     dest="lr", default=1e-4, help="learning rate")
@@ -132,7 +132,7 @@ class Config:
     def __init__(self):
         # Model parameters
         self.patch_size = 4
-        self.in_chans = 2                  # Number of input channels
+        self.in_chans = 5                  # Number of input channels
         self.embed_dim = 16                # Embedding dimension
         self.depths = (2, 2, 2, 2, 2, 2)         # Depth of each Swin Transformer layer
         self.num_heads = (4, 4, 4, 4, 4, 4)      # Number of attention heads in each layer
@@ -443,7 +443,7 @@ def physics_losses_linear(pred_sigma_voigt, u_disp, healthy_mask, pathology_mask
         eq_mask = healthy_mask.bool() | pathology_mask.bool()
         eq_mask = eq_mask.float()
     else:
-        eq_mask = healthy_mask
+        eq_mask = healthy_mask.bool()
 
     # 3. Compute losses
     losses = {}
@@ -554,7 +554,7 @@ def train():
     # Create a list of indices for K-Fold on the first 140
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    start_fold = 0  # Start from second fold
+    start_fold = 2  # Start from second fold
 
     for fold, (train_index, val_index) in enumerate(kf.split(train_val_indices)):
         if fold < start_fold:
@@ -575,15 +575,15 @@ def train():
         train_fixed.extend([fixed_t1ce_list[i] for i in train_only_indices])
         train_moving.extend([moving_t1ce_list[i] for i in train_only_indices])
     
-        model_lvl1 = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(2, 3, start_channel, is_train=True,
+        model_lvl1 = swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(2, 3, start_channel, is_train=True,
                                                                     imgshape=imgshape_4,
                                                                     range_flow=range_flow, num_block=num_cblock).cuda()
-        model_lvl2 = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(2, 3, start_channel, is_train=True,
+        model_lvl2 = swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(2, 3, start_channel, is_train=True,
                                                                     imgshape=imgshape_2,
                                                                     range_flow=range_flow, model_lvl1=model_lvl1,
                                                                     num_block=num_cblock).cuda()
 
-        model = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(2, 3, start_channel, is_train=True, imgshape=imgshape,
+        model = swin_Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(2, 3, start_channel, is_train=True, imgshape=imgshape,
                                                                 range_flow=range_flow, model_lvl2=model_lvl2,
                                                                 num_block=num_cblock).cuda()
         # model = Miccai2021_LDR_laplacian_TransMorph_lvl3(is_train=True, imgshape=imgshape,
@@ -658,23 +658,23 @@ def train():
                                             shuffle=True, num_workers=2)
 
         step = 0
-        if fold ==0:
+        if fold ==2:
             load_model = True
         else:
             load_model = False
         if load_model is True:
-            model_path = "/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/1Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_72000.pth"
+            model_path = "/workspace/DIRAC/Model/sw_Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/3sw_Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_108000.pth"
             print("Loading weight: ", model_path)
-            step = 72000
+            step = 116000
             model.load_state_dict(torch.load(model_path))
             # specialist_head.load_state_dict(torch.load(os.path.join(model_dir, f'specialist_head_step_{step}.pth')))
-            temp_lossall = np.load("/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/loss1Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_72000.npy")
-            lossall[:, 0:72000] = temp_lossall[:, 0:72000]
+            temp_lossall = np.load("/workspace/DIRAC/Model/sw_Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/loss3sw_Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_108000.npy")
+            lossall[:, 0:116000] = temp_lossall[:, 0:116000]
 
         # Add sigmoid activation to ensure uncertainty is in [0,1]
         uncertainty_activation = torch.nn.Softplus()
         device = 'cuda'
-
+        
         while step < iteration_lvl3:
             for X, Y in training_generator:
                 
@@ -698,6 +698,7 @@ def train():
                 # --- Forward Pass with Uncertainty Output ---
                 compose_field_e0_lvl1_xy, warpped_inputx_lvl1_out_xy, y_xy, output_disp_e0_v_xy, lvl1_v_xy, lvl2_disp_xy, e0_xy, stress_field_xy, output_uncertainty_xy = model(X, Y, reg_code)
                 compose_field_e0_lvl1_yx, warpped_inputx_lvl1_out_yx, y_yx, output_disp_e0_v_yx, lvl1_v_yx, lvl2_disp_yx, e0_yx, stress_field_yx, output_uncertainty_yx = model(Y, X, reg_code)
+
                 F_X_Y_warpped = transform(compose_field_e0_lvl1_xy, compose_field_e0_lvl1_yx.permute(0, 2, 3, 4, 1), grid_unit)
                 F_Y_X_warpped = transform(compose_field_e0_lvl1_yx, compose_field_e0_lvl1_xy.permute(0, 2, 3, 4, 1), grid_unit)
 
@@ -707,6 +708,7 @@ def train():
                 # smoothing
                 norm_diff_fw = torch.norm(diff_fw, dim=1, keepdim=True)
                 norm_diff_bw = torch.norm(diff_bw, dim=1, keepdim=True)
+                
                 # Apply sigmoid to ensure uncertainty is in [0, infinite]
                 output_uncertainty_xy = uncertainty_activation(output_uncertainty_xy)
                 output_uncertainty_yx = uncertainty_activation(output_uncertainty_yx)
@@ -752,7 +754,7 @@ def train():
                     # weighted_certainty_map = 1.0 - alpha * uncertainty_mask * brain_mask_1ch
                     # loss_multiNCC = loss_similarity(warpped_inputx_lvl1_out_xy, Y, weighted_certainty_map)
                     
-                    # Build healthy vs pathology masks (example):
+                                        # Build healthy vs pathology masks (example):
                     uncertainty_threshold = 0.3
                     pathology_mask_xy = (output_uncertainty_xy * brain_mask_1ch > uncertainty_threshold).float()  # pathological / high-uncertainty
                     pathology_mask_yx = (output_uncertainty_yx * brain_mask_1ch_yx > uncertainty_threshold).float()  # pathological / high-uncertainty
@@ -769,7 +771,7 @@ def train():
                                                 lam_path_init=10.0,
                                                 mu_path_init=1.0,
                                                 n_samples_eq=2048,
-                                                n_samples_const=1024,
+                                                n_samples_const=2048,
                                                 n_samples_energy=1024,
                                                 spacing=(1.0,1.0,1.0),
                                                 device=device)
@@ -783,7 +785,7 @@ def train():
                                                 lam_path_init=10.0,
                                                 mu_path_init=1.0,
                                                 n_samples_eq=2048,
-                                                n_samples_const=1024,
+                                                n_samples_const=2048,
                                                 n_samples_energy=1024,
                                                 spacing=(1.0,1.0,1.0),
                                                 device=device)
@@ -959,13 +961,13 @@ def train():
                 # --- Progress output ---
                 if step < 2000:
                     sys.stdout.write(
-                        "\r" + 'step "{0}" -> total loss "{1:.4f}" - sim "{2:.4f}" - reg "{3:.4f}"'.format(
-                            step, loss.item(), loss_multiNCC.item(), loss_regulation.item()))
+                        "\r" + 'step "{0}" -> total loss "{1:.4f}" - sim "{2:.4f}" - reg "{3:.4f}" - inv "{4:.4f}"'.format(
+                            step, loss.item(), loss_multiNCC.item(), loss_regulation.item(), loss_inverse.item()))
                 else:
                     sys.stdout.write(
-                        "\r" + 'step "{0}" -> total loss "{1:.4f}" - sim "{2:.4f}" - reg "{3:.4f}" - unc_sup "{4:.4f}" - phy "{5:.4f}"'.format(
+                        "\r" + 'step "{0}" -> total loss "{1:.4f}" - sim "{2:.4f}" - reg "{3:.4f}" - unc_sup "{4:.4f}" - phy "{5:.4f}" - inv "{6:.4f}"'.format(
                             step, loss.item(), loss_multiNCC.item(), loss_regulation.item(), 
-                            loss_uncertainty_supervision.item(), loss_physics.item()))
+                            loss_uncertainty_supervision.item(), loss_physics.item(), loss_inverse.item()))
                 sys.stdout.flush()
                 
                 # Visualize periodically

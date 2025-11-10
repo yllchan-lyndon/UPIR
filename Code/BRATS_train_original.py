@@ -164,8 +164,12 @@ def train():
     # Create a list of indices for K-Fold on the first 140
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    # Iterate over each fold
+    start_fold = 4  # Start from second fold
+
     for fold, (train_index, val_index) in enumerate(kf.split(train_val_indices)):
+        if fold < start_fold:
+            print(f"Skipping fold {fold + 1}")
+            continue
         print(f"Fold {fold + 1}/{kf.get_n_splits()}")
         
         # Prepare training and validation sets
@@ -241,15 +245,15 @@ def train():
                                             batch_size=1,
                                             shuffle=True, num_workers=2)
         step = 0
-        if fold==0 and step==0:
+        if fold==4 and step==0:
             load_model = True
             if load_model is True:
-                model_path = "/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_1stagelvl3_10000.pth"
+                model_path = "/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_5stagelvl3_82000.pth"
                 print("Loading weight: ", model_path)
-                step = 10000
+                step = 82000
                 model.load_state_dict(torch.load(model_path))
-                temp_lossall = np.load("/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/lossBrats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_1stagelvl3_10000.npy")
-                lossall[:, 0:10000] = temp_lossall[:, 0:10000]
+                temp_lossall = np.load("/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/lossBrats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_5stagelvl3_82000.npy")
+                lossall[:, 0:82000] = temp_lossall[:, 0:82000]
 
         while step <= iteration_lvl3:
             for X, Y in training_generator:
@@ -374,6 +378,7 @@ def train():
                     # dice_total = []
                     tre_total = []
                     print("\nValiding...")
+                    robustness_scores = []
                     for batch_idx, data in enumerate(valid_generator):
                         # X, Y, X_label, Y_label = data['move'].to(device), data['fixed'].to(device), \
                         #                          data['move_label'].numpy()[0], data['fixed_label'].numpy()[0]
@@ -589,13 +594,41 @@ def train():
                             ax.set_title('Deformation Field (Quiver)'); ax.axis('off')
                             plt.savefig(os.path.join(f"step_{batch_idx}_quiver.png"), bbox_inches='tight')
                             plt.close(fig)
+                            # --- Before registration ---
+                            tre_before = np.linalg.norm(moving_keypoints - fixed_keypoints, axis=1)
+
+                            # --- After registration ---
+                            tre_after = np.linalg.norm(warped_moving_keypoint - fixed_keypoints, axis=1)
+
+                            # --- Landmark-level improvement check ---
+                            improved_landmarks = np.sum(tre_after < tre_before)
+                            total_landmarks = len(tre_before)
+
+                            # --- Robustness for this pair (BraTS-Reg definition) ---
+                            robustness_pair = improved_landmarks / total_landmarks
+
+                            # Store it
+                            robustness_scores.append(robustness_pair)
+
                         # --- End of Visualization Code ---
 
+                    # Calculate mean and standard deviation
                     tre_total = np.array(tre_total)
-                    print("TRE mean: ", tre_total.mean())
+                    print(tre_total)
+                    tre_mean = tre_total.mean()
+                    tre_std = tre_total.std()
+                    R_mean = np.mean(robustness_scores)
+                    R_std = np.std(robustness_scores)
+                    print(f"Robustness - Mean: {R_mean:.4f}, Std: {R_std:.4f}")
+
+                    print(f"TRE - Mean: {tre_mean:.4f}mm, Std: {tre_std:.4f}mm")
+                    print(f"TRE - Min: {tre_total.min():.4f}mm, Max: {tre_total.max():.4f}mm")
+                    
+
+                    # Log both mean and standard deviation
                     log_dir = f"/workspace/DIRAC/Log/{fold + 1}without_Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_.txt"
                     with open(log_dir, "a") as log:
-                        log.write(str(step) + ":" + str(tre_total.mean()) + "\n")
+                        log.write(f"{step}: Mean={tre_mean:.4f}, Std={tre_std:.4f}, Min={tre_total.min():.4f}, Max={tre_total.max():.4f}\n, R={R_mean:.4f}, R_std={R_std:.4f}\n")
 
                 # if step == freeze_step:
                 #     model.unfreeze_modellvl2()

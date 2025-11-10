@@ -1,3 +1,13 @@
 /Data/
 /Model/
 /Log/
+/Code/BRATS_test_DIRAC_D.py
+/Code/BRATS_test_DIRAC.py
+/Code/BRATS_train_DIRAC_D.py
+/Code/BRATS_train_DIRAC.py
+/Code/BRATS_train_original.py
+/Code/bratsreg_model_original.py
+/Code/cnn_swin.py
+/Code/platform.py
+/Code/seg.py
+/Code/train_original.py
