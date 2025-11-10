@@ -13,9 +13,9 @@ from scipy.ndimage import map_coordinates, binary_dilation
 
 # Model imports
 from bratsreg_model_stage import (
-    Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1,
-    Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2,
-    Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3,
+    UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1,
+    UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2,
+    UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3,
     SpatialTransform_unit
 )
 from Functions import Validation_Brats_with_mask, jacobian_determinant, generate_grid_unit
@@ -241,22 +241,22 @@ def evaluate():
         test_moving_csv = [moving_csv_list[i] for i in train_val_indices[test_idx]]
         test_tumor_seg = [tumor_seg_list[i] for i in train_val_indices[test_idx]]
         if fold==0:
-            model_path = f'/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/1Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_92000.pth'
+            model_path = f'/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/1UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_92000.pth'
         elif fold==1:
-            model_path = f'/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/2Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_124000.pth'
+            model_path = f'/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/2UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_124000.pth'
         elif fold==2:
-            model_path = f'/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/3Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_46000.pth'
+            model_path = f'/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/3UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_46000.pth'
         elif fold==3:
-            model_path = f'/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/4Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_130000.pth'
+            model_path = f'/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/4UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_130000.pth'
         else:
-            model_path = f'/workspace/DIRAC/Model/Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github/5Brats_NCC_disp_fea6b5_AdaIn64_t1ce_fbcon_occ01_inv1_a0015_aug_mean_fffixed_github_stagelvl3_96000.pth'
+            model_path = f'/workspace/DIRAC/Model/UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github/5UPIR_NCC_fea6b5_AdaIn64_t1ce_fbcon_aug_mean_fffixed_github_stagelvl3_96000.pth'
         if not os.path.exists(model_path):
             print("Model not found:", model_path)
             continue
         
-        model_lvl1 = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl1(2, 3, start_channel, is_train=True, imgshape=imgshape_4, range_flow=range_flow, num_block=num_cblock).cuda()
-        model_lvl2 = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl2(2, 3, start_channel, is_train=True, imgshape=imgshape_2, range_flow=range_flow, model_lvl1=model_lvl1, num_block=num_cblock).cuda()
-        model = Miccai2021_LDR_laplacian_unit_disp_add_AdaIn_lvl3(2, 3, start_channel, is_train=True, imgshape=imgshape, range_flow=range_flow, model_lvl2=model_lvl2, num_block=num_cblock).cuda()
+        model_lvl1 = UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl1(2, 3, start_channel, is_train=True, imgshape=imgshape_4, range_flow=range_flow, num_block=num_cblock).cuda()
+        model_lvl2 = UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl2(2, 3, start_channel, is_train=True, imgshape=imgshape_2, range_flow=range_flow, model_lvl1=model_lvl1, num_block=num_cblock).cuda()
+        model = UPIR_LDR_laplacian_unit_disp_add_AdaIn_lvl3(2, 3, start_channel, is_train=True, imgshape=imgshape, range_flow=range_flow, model_lvl2=model_lvl2, num_block=num_cblock).cuda()
 
         model.load_state_dict(torch.load(model_path))
         model.eval()
