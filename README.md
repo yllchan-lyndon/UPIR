@@ -18,7 +18,7 @@ python evaluate.py
 ```
 
 ## Train your own model
-Step 1: Download the BraTS-Reg dataset from https://www.med.upenn.edu/cbica/brats-reg-challenge/
+Step 1: Download the BraTS-Reg dataset from https://zenodo.org/records/14642405.
 
 Step 2: Define and split the dataset into training and validation set, or run the five-fold cross validation directly as in train.py.
 
